@@ -1,0 +1,19 @@
+{
+  "workflows": {
+    "mNkvQ1RTCJq6286Z": {
+      "lastSyncedHash": "0cfbd5c2d2bd022b9be76cbbc47c75665a2843684933ee2cc2a7a90fb01bd72b",
+      "lastSyncedAt": "2026-03-08T21:18:36.408Z",
+      "filename": "n8nac-demo-workflow.workflow.ts"
+    },
+    "OJ9K7iAHNnrw2GMI": {
+      "lastSyncedHash": "b30834630f3d372f8387f701b418df00649175e537ca211d1780ab1bbe7e60a4",
+      "lastSyncedAt": "2026-03-08T21:36:01.858Z",
+      "filename": "Example - Wired RSS One Title.workflow.ts"
+    },
+    "eDNQVrqtgzoMbgHw": {
+      "lastSyncedHash": "1cd38d499f2b6508cfaca68ba823af2e95384775f9d58342f5ba96a5590a63b7",
+      "lastSyncedAt": "2026-03-09T19:03:06.196Z",
+      "filename": "Shitpost Bot - Reddit Weekly to Discord.workflow.ts"
+    }
+  }
+}

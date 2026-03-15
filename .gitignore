@@ -1,0 +1,15 @@
+# Secrets
+.env
+*passphrase*
+
+# Runtime data
+n8n_data/
+shitpost_data/
+shared_media/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node
+automations/node_modules/

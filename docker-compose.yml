@@ -1,0 +1,43 @@
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      - TZ=${TZ}
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_LISTEN_ADDRESS=0.0.0.0
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - N8N_SECURE_COOKIE=false
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=${N8N_BLOCK_ENV_ACCESS_IN_NODE}
+      - N8N_RESTRICT_FILE_ACCESS_TO=${N8N_RESTRICT_FILE_ACCESS_TO}
+      - SHITPOST_SERVICE_URL=${SHITPOST_SERVICE_URL}
+      - SHITPOST_DISCORD_WEBHOOK_URL=${SHITPOST_DISCORD_WEBHOOK_URL}
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./shared_media:/home/node/.n8n-files/shitpost_media
+    depends_on:
+      - shitpost-worker
+
+  shitpost-worker:
+    build:
+      context: ./shitpost_worker
+    container_name: shitpost-worker
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - SHITPOST_REGISTRY_PATH=${SHITPOST_REGISTRY_PATH}
+      - SHITPOST_SHARED_MEDIA_DIR=${SHITPOST_SHARED_MEDIA_DIR}
+      - SHITPOST_DOWNLOAD_TIMEOUT_SECONDS=${SHITPOST_DOWNLOAD_TIMEOUT_SECONDS}
+      - SHITPOST_MAX_MEDIA_BYTES=${SHITPOST_MAX_MEDIA_BYTES}
+      - SHITPOST_RSS_USER_AGENT=${SHITPOST_RSS_USER_AGENT}
+    volumes:
+      - ./shared_media:/home/node/.n8n-files/shitpost_media
+      - ./shitpost_data:/data

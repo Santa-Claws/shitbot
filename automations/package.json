@@ -1,0 +1,21 @@
+{
+  "name": "automations",
+  "version": "1.0.0",
+  "description": "n8n automations managed as code with n8n-as-code",
+  "main": "index.js",
+  "scripts": {
+    "n8nac": "n8nac",
+    "list": "n8nac list",
+    "list:remote": "n8nac list --remote",
+    "pull": "n8nac pull",
+    "push": "n8nac push",
+    "update-ai": "n8nac update-ai"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@n8n-as-code/cli": "^0.9.8"
+  }
+}
