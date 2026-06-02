@@ -80,13 +80,8 @@ def run_post_job() -> None:
             attempt_id = prep_data.get("attemptId")
             status = prep_data.get("status")
 
-            if status != "ok":
-                if attempt_id:
-                    requests.post(
-                        f"{WORKER_URL}/api/finalize-attempt",
-                        json={"attemptId": attempt_id, "outcome": status or "error"},
-                        timeout=10,
-                    )
+            if status != "ready":
+                # Worker already finalized skip/error cases; just move on
                 continue
 
             file_name = prep_data.get("fileName")
