@@ -1,0 +1,711 @@
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+
+APP = Flask(__name__)
+
+DB_PATH = Path(os.getenv("SHITPOST_REGISTRY_PATH", "/data/repost_registry.sqlite"))
+SUBS_PATH = Path("/data/subreddits.json")
+MEDIA_DIR = Path("/media")
+WORKER_URL = os.getenv("SHITPOST_SERVICE_URL", "http://shitpost-worker:8000").rstrip("/")
+N8N_URL = os.getenv("N8N_URL", "http://n8n:5678").rstrip("/")
+N8N_API_KEY = os.getenv("N8N_API_KEY", "")
+N8N_WORKFLOW_ID = os.getenv("N8N_WORKFLOW_ID", "")
+
+DEFAULT_SUBS = [
+    {"name": "MemeVideos", "weight": 1.0},
+    {"name": "MurderedByWords", "weight": 1.0},
+    {"name": "blursed_videos", "weight": 1.0},
+    {"name": "Kitchencels", "weight": 1.0},
+    {"name": "addressme", "weight": 1.0},
+    {"name": "CursedGuns", "weight": 1.0},
+    {"name": "perfectlycutvideos", "weight": 1.0},
+]
+
+STATUS_COLORS = {
+    "posted": "green", "downloaded": "blue", "attempt_started": "grey",
+    "duplicate_hash": "orange", "already_known": "orange",
+    "download_failed": "red", "download_timeout": "red",
+    "unsupported_media": "yellow", "image_too_large": "yellow",
+    "media_too_large": "yellow", "read_failed": "red", "discord_failed": "red",
+    "cleanup": "grey",
+}
+
+NAV = """
+<nav>
+  <ul><li><strong>🤖 Shitbot</strong></li></ul>
+  <ul>
+    <li><a href="/" {da}>Dashboard</a></li>
+    <li><a href="/subreddits" {sa}>Subreddits</a></li>
+    <li><a href="/history" {ha}>History</a></li>
+    <li><a href="/errors" {ea}>Errors</a></li>
+    <li><a href="/stats" {sta}>Stats</a></li>
+    <li><a href="/feed-preview" {fa}>Feed Preview</a></li>
+    <li><a href="/trigger" {ta}>▶ Run Now</a></li>
+  </ul>
+</nav>
+"""
+
+CSS = """
+<style>
+  nav{padding:.5rem 1rem}
+  .al{color:var(--pico-primary)!important}
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:1rem;margin-bottom:1.5rem}
+  .stat-card{background:var(--pico-card-background-color);border:1px solid var(--pico-card-border-color);border-radius:var(--pico-border-radius);padding:1rem 1.25rem}
+  .stat-card .num{font-size:2rem;font-weight:700;line-height:1;margin-bottom:.25rem}
+  .stat-card .lbl{font-size:.8rem;color:var(--pico-muted-color);text-transform:uppercase;letter-spacing:.05em}
+  .badge{display:inline-block;padding:.15em .5em;border-radius:999px;font-size:.75rem;font-weight:600}
+  .bg{background:#1a3d1a;color:#4caf50} .br{background:#3d1a1a;color:#f44336}
+  .bo{background:#3d2a1a;color:#ff9800} .bb{background:#1a2a3d;color:#2196f3}
+  .by{background:#3d3a1a;color:#ffeb3b} .bgr{background:#2a2a2a;color:#9e9e9e}
+  .hdot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
+  .hok{background:#4caf50} .herr{background:#f44336}
+  .cw{position:relative;max-height:280px}
+  .ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
+  .mu{color:var(--pico-muted-color);font-size:.85rem}
+  table{font-size:.88rem}
+</style>
+"""
+
+HEAD = """<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{title} — Shitbot Manager</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  {css}
+</head>
+<body>
+{nav}
+<main class="container">
+"""
+
+FOOT = "\n</main></body></html>"
+
+
+def a(flag: bool) -> str:
+    return 'class="al"' if flag else ""
+
+
+def layout(body: str, active: str = "", title: str = "Shitbot") -> str:
+    nav = NAV.format(
+        da=a(active == "d"), sa=a(active == "s"), ha=a(active == "h"),
+        ea=a(active == "e"), sta=a(active == "st"), fa=a(active == "f"),
+        ta=a(active == "t"),
+    )
+    return HEAD.format(title=title, css=CSS, nav=nav) + body + FOOT
+
+
+def db():
+    if not DB_PATH.exists():
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_subs() -> list[dict]:
+    if SUBS_PATH.exists():
+        try:
+            return json.loads(SUBS_PATH.read_text())
+        except Exception:
+            pass
+    return list(DEFAULT_SUBS)
+
+
+def save_subs(subs: list[dict]) -> None:
+    SUBS_PATH.write_text(json.dumps(subs, indent=2))
+
+
+def badge(status: str) -> str:
+    c = {"green": "bg", "red": "br", "orange": "bo", "blue": "bb",
+         "yellow": "by", "grey": "bgr"}.get(STATUS_COLORS.get(status, "grey"), "bgr")
+    return f'<span class="badge {c}">{status}</span>'
+
+
+def fsize(n) -> str:
+    if not n:
+        return "—"
+    n = int(n)
+    return f"{n/1_000_000:.1f} MB" if n >= 1_000_000 else f"{n/1_000:.0f} KB"
+
+
+def worker_health() -> bool:
+    try:
+        return requests.get(f"{WORKER_URL}/healthz", timeout=3).ok
+    except Exception:
+        return False
+
+
+def n8n_health() -> bool:
+    try:
+        return requests.get(f"{N8N_URL}/healthz", timeout=3).ok
+    except Exception:
+        return False
+
+
+def n8n_get(path: str):
+    try:
+        r = requests.get(f"{N8N_URL}{path}", headers={"X-N8N-API-KEY": N8N_API_KEY}, timeout=5)
+        return r.json() if r.ok else None
+    except Exception:
+        return None
+
+
+def media_usage() -> tuple[int, int]:
+    total, count = 0, 0
+    if MEDIA_DIR.exists():
+        for f in MEDIA_DIR.iterdir():
+            if f.is_file():
+                total += f.stat().st_size
+                count += 1
+    return total, count
+
+
+# ── Dashboard ────────────────────────────────────────────────────────────────
+
+@APP.get("/")
+def dashboard():
+    conn = db()
+    stats = {"total": 0, "posted": 0, "today": 0, "success_rate": 0}
+    recent, status_counts = [], {}
+    if conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stats["total"] = conn.execute("SELECT COUNT(*) FROM repost_registry").fetchone()[0]
+        stats["posted"] = conn.execute("SELECT COUNT(*) FROM repost_registry WHERE status='posted'").fetchone()[0]
+        stats["today"] = conn.execute(
+            "SELECT COUNT(*) FROM repost_registry WHERE status='posted' AND DATE(finalized_at)=?", (today,)
+        ).fetchone()[0]
+        stats["success_rate"] = round(stats["posted"] / stats["total"] * 100) if stats["total"] else 0
+        rows = conn.execute("SELECT status, COUNT(*) n FROM repost_registry GROUP BY status ORDER BY n DESC").fetchall()
+        status_counts = {r["status"]: r["n"] for r in rows}
+        recent = conn.execute(
+            "SELECT subreddit, title, canonical_post_url, mime_type, finalized_at "
+            "FROM repost_registry WHERE status='posted' ORDER BY finalized_at DESC LIMIT 10"
+        ).fetchall()
+        conn.close()
+
+    wok = worker_health()
+    nok = n8n_health()
+    dbytes, dcount = media_usage()
+    sc_labels = json.dumps(list(status_counts.keys()))
+    sc_values = json.dumps(list(status_counts.values()))
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    recent_rows = "".join(
+        f"<tr><td>r/{r['subreddit']}</td>"
+        f"<td><a href='{r['canonical_post_url']}' target='_blank' rel='noopener'>{(r['title'] or '')[:70]}{'…' if r['title'] and len(r['title'])>70 else ''}</a></td>"
+        f"<td>{r['mime_type'] or '—'}</td>"
+        f"<td class='mu'>{(r['finalized_at'] or '')[:16]}</td></tr>"
+        for r in recent
+    )
+
+    body = f"""
+<div class="ph"><h2>Dashboard</h2><span class="mu">{now}</span></div>
+<div class="stat-grid">
+  <div class="stat-card"><div class="num">{stats['total']}</div><div class="lbl">Total Attempts</div></div>
+  <div class="stat-card"><div class="num" style="color:#4caf50">{stats['posted']}</div><div class="lbl">Posted</div></div>
+  <div class="stat-card"><div class="num">{stats['today']}</div><div class="lbl">Posted Today</div></div>
+  <div class="stat-card"><div class="num">{stats['success_rate']}%</div><div class="lbl">Success Rate</div></div>
+  <div class="stat-card"><div class="num">{round(dbytes/1_000_000,1)}</div><div class="lbl">Media MB ({dcount} files)</div></div>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.5rem">
+  <article>
+    <header><strong>System Health</strong></header>
+    <p><span class="hdot {'hok' if wok else 'herr'}"></span>shitpost-worker {'online' if wok else 'offline'}</p>
+    <p><span class="hdot {'hok' if nok else 'herr'}"></span>n8n {'online' if nok else 'offline'}</p>
+  </article>
+  <article>
+    <header><strong>Status Breakdown</strong></header>
+    <div class="cw"><canvas id="sc"></canvas></div>
+  </article>
+</div>
+<article>
+  <header><strong>Recently Posted</strong></header>
+  {'<table><thead><tr><th>Subreddit</th><th>Title</th><th>Type</th><th>Time</th></tr></thead><tbody>' + recent_rows + '</tbody></table>' if recent else '<p class="mu">No posts yet.</p>'}
+</article>
+<script>
+new Chart(document.getElementById('sc'),{{
+  type:'doughnut',
+  data:{{labels:{sc_labels},datasets:[{{data:{sc_values},borderWidth:1}}]}},
+  options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'right',labels:{{font:{{size:11}}}}}}}}}}
+}});
+</script>
+"""
+    return layout(body, active="d", title="Dashboard")
+
+
+# ── Subreddits ───────────────────────────────────────────────────────────────
+
+@APP.get("/subreddits")
+def subreddits_page():
+    subs = load_subs()
+    conn = db()
+    sub_stats = {}
+    if conn:
+        rows = conn.execute(
+            "SELECT subreddit, COUNT(*) total, SUM(CASE WHEN status='posted' THEN 1 ELSE 0 END) posted "
+            "FROM repost_registry GROUP BY subreddit"
+        ).fetchall()
+        sub_stats = {r["subreddit"]: dict(r) for r in rows}
+        conn.close()
+
+    def rate(name):
+        st = sub_stats.get(name, {})
+        t = st.get("total", 0)
+        return f"{round(st.get('posted',0)/t*100)}%" if t else "—"
+
+    rows_html = "".join(
+        f"<tr>"
+        f"<td><a href='https://reddit.com/r/{s['name']}' target='_blank'>r/{s['name']}</a></td>"
+        f"<td><form method='post' action='/subreddits/weight' style='display:flex;gap:.3rem;align-items:center;margin:0'>"
+        f"<input type='hidden' name='name' value='{s['name']}'>"
+        f"<input type='number' name='weight' value='{s['weight']}' min='0.1' max='100' step='0.1' style='width:68px;margin:0;padding:.2rem .4rem'>"
+        f"<button type='submit' style='padding:.2rem .6rem;margin:0'>Set</button></form></td>"
+        f"<td>{sub_stats.get(s['name'],{}).get('total',0)}</td>"
+        f"<td>{sub_stats.get(s['name'],{}).get('posted',0)}</td>"
+        f"<td>{rate(s['name'])}</td>"
+        f"<td><form method='post' action='/subreddits/remove' onsubmit=\"return confirm('Remove r/{s['name']}?')\" style='margin:0'>"
+        f"<input type='hidden' name='name' value='{s['name']}'>"
+        f"<button type='submit' class='secondary' style='padding:.2rem .6rem;margin:0'>Remove</button></form></td>"
+        f"</tr>"
+        for s in subs
+    )
+
+    body = f"""
+<div class="ph"><h2>Subreddits</h2></div>
+<article>
+<table>
+  <thead><tr><th>Subreddit</th><th>Weight</th><th>Attempts</th><th>Posted</th><th>Success</th><th></th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+</article>
+<article>
+  <header><strong>Add Subreddit</strong></header>
+  <form method="post" action="/subreddits/add" style="display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap">
+    <label style="flex:1;min-width:150px">Name<input type="text" name="name" placeholder="subredditname" required></label>
+    <label style="width:100px">Weight<input type="number" name="weight" value="1.0" min="0.1" max="100" step="0.1"></label>
+    <button type="submit" style="margin-bottom:1px">Add</button>
+  </form>
+</article>
+"""
+    return layout(body, active="s", title="Subreddits")
+
+
+@APP.post("/subreddits/add")
+def subreddits_add():
+    name = request.form.get("name", "").strip()
+    try:
+        weight = round(float(request.form.get("weight", 1.0)), 4)
+    except ValueError:
+        weight = 1.0
+    if name:
+        subs = load_subs()
+        if not any(s["name"].lower() == name.lower() for s in subs):
+            subs.append({"name": name, "weight": max(0.1, weight)})
+            save_subs(subs)
+    return redirect(url_for("subreddits_page"))
+
+
+@APP.post("/subreddits/remove")
+def subreddits_remove():
+    name = request.form.get("name", "").strip()
+    if name:
+        save_subs([s for s in load_subs() if s["name"] != name])
+    return redirect(url_for("subreddits_page"))
+
+
+@APP.post("/subreddits/weight")
+def subreddits_weight():
+    name = request.form.get("name", "").strip()
+    try:
+        weight = round(float(request.form.get("weight", 1.0)), 4)
+    except ValueError:
+        weight = 1.0
+    if name:
+        subs = load_subs()
+        for s in subs:
+            if s["name"] == name:
+                s["weight"] = max(0.1, weight)
+        save_subs(subs)
+    return redirect(url_for("subreddits_page"))
+
+
+# ── History ──────────────────────────────────────────────────────────────────
+
+@APP.get("/history")
+def history_page():
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = 50
+    sub_f = request.args.get("sub", "")
+    status_f = request.args.get("status", "")
+
+    conn = db()
+    rows, total, subs, statuses = [], 0, [], []
+    if conn:
+        subs = [r[0] for r in conn.execute("SELECT DISTINCT subreddit FROM repost_registry ORDER BY subreddit").fetchall()]
+        statuses = [r[0] for r in conn.execute("SELECT DISTINCT status FROM repost_registry ORDER BY status").fetchall()]
+        where, params = [], []
+        if sub_f:
+            where.append("subreddit=?"); params.append(sub_f)
+        if status_f:
+            where.append("status=?"); params.append(status_f)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        total = conn.execute(f"SELECT COUNT(*) FROM repost_registry {clause}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT id, subreddit, title, canonical_post_url, status, mime_type, media_bytes, "
+            f"failure_reason, canonical_media_url, content_hash, created_at, finalized_at "
+            f"FROM repost_registry {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [per_page, (page - 1) * per_page]
+        ).fetchall()
+        conn.close()
+
+    total_pages = max(1, (total + per_page - 1) // per_page)
+
+    sub_opts = "".join(f"<option value='{s}' {'selected' if sub_f==s else ''}>r/{s}</option>" for s in subs)
+    st_opts = "".join(f"<option value='{s}' {'selected' if status_f==s else ''}>{s}</option>" for s in statuses)
+
+    def tr(r):
+        title = r['title'] or ''
+        detail = ""
+        if r['failure_reason']:
+            detail += f"<div>⚠ {r['failure_reason'][:200]}</div>"
+        if r['canonical_media_url']:
+            detail += f"<div>Media: {r['canonical_media_url'][:80]}</div>"
+        if r['content_hash']:
+            detail += f"<div>Hash: {r['content_hash'][:16]}…</div>"
+        ts = (r['finalized_at'] or r['created_at'] or '')[:16]
+        return (
+            f"<tr><td>{r['id']}</td><td>r/{r['subreddit']}</td>"
+            f"<td><details><summary><a href='{r['canonical_post_url']}' target='_blank' rel='noopener'>"
+            f"{title[:60]}{'…' if len(title)>60 else ''}</a></summary>"
+            f"<small class='mu'>{detail}</small></details></td>"
+            f"<td>{badge(r['status'])}</td><td>{r['mime_type'] or '—'}</td>"
+            f"<td>{fsize(r['media_bytes'])}</td><td class='mu'>{ts}</td></tr>"
+        )
+
+    rows_html = "".join(tr(r) for r in rows)
+    qs = f"sub={sub_f}&status={status_f}"
+    prev_btn = f"<a href='/history?page={page-1}&{qs}' role='button' class='secondary'>← Prev</a>" if page > 1 else ""
+    next_btn = f"<a href='/history?page={page+1}&{qs}' role='button' class='secondary'>Next →</a>" if page < total_pages else ""
+    clear_btn = f"<a href='/history' role='button' class='secondary'>Clear</a>" if sub_f or status_f else ""
+
+    body = f"""
+<div class="ph"><h2>History</h2><span class="mu">{total} records</span></div>
+<form method="get" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1rem">
+  <select name="sub" style="width:auto"><option value="">All subreddits</option>{sub_opts}</select>
+  <select name="status" style="width:auto"><option value="">All statuses</option>{st_opts}</select>
+  <button type="submit">Filter</button>{clear_btn}
+</form>
+<article>
+<table>
+  <thead><tr><th>#</th><th>Subreddit</th><th>Title</th><th>Status</th><th>Type</th><th>Size</th><th>Time</th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+</article>
+<nav style="display:flex;gap:.5rem;justify-content:center">
+  {prev_btn}<span style="padding:.5rem 1rem" class="mu">{page} / {total_pages}</span>{next_btn}
+</nav>
+"""
+    return layout(body, active="h", title="History")
+
+
+# ── Errors ───────────────────────────────────────────────────────────────────
+
+@APP.get("/errors")
+def errors_page():
+    conn = db()
+    groups, stuck = {}, 0
+    if conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) n FROM repost_registry "
+            "WHERE status NOT IN ('posted','downloaded','attempt_started') "
+            "GROUP BY status ORDER BY n DESC"
+        ).fetchall()
+        for r in rows:
+            ex = conn.execute(
+                "SELECT subreddit, title, canonical_post_url, failure_reason, created_at "
+                "FROM repost_registry WHERE status=? ORDER BY id DESC LIMIT 5", (r["status"],)
+            ).fetchall()
+            groups[r["status"]] = {"count": r["n"], "examples": ex}
+        stuck = conn.execute(
+            "SELECT COUNT(*) FROM repost_registry "
+            "WHERE status IN ('attempt_started','downloaded') AND finalized_at IS NULL "
+            "AND CAST((julianday('now')-julianday(created_at))*86400 AS INTEGER) > 3600"
+        ).fetchone()[0]
+        conn.close()
+
+    cleanup_btn = f"<form method='post' action='/errors/cleanup'><button type='submit' class='secondary'>🧹 Clean up {stuck} stuck attempts</button></form>" if stuck > 0 else ""
+
+    sections = ""
+    for status, data in groups.items():
+        ex_rows = "".join(
+            f"<tr><td>r/{e['subreddit']}</td>"
+            f"<td><a href='{e['canonical_post_url']}' target='_blank'>{(e['title'] or '')[:50]}{'…' if e['title'] and len(e['title'])>50 else ''}</a></td>"
+            f"<td class='mu' style='font-size:.8rem'>{(e['failure_reason'] or '—')[:120]}</td>"
+            f"<td class='mu'>{(e['created_at'] or '')[:16]}</td></tr>"
+            for e in data["examples"]
+        )
+        sections += f"""
+<article>
+  <header style="display:flex;align-items:center;gap:.75rem">{badge(status)} <strong>{data['count']} occurrences</strong></header>
+  <table><thead><tr><th>Subreddit</th><th>Title</th><th>Reason</th><th>Time</th></tr></thead>
+  <tbody>{ex_rows}</tbody></table>
+</article>"""
+
+    body = f"""
+<div class="ph"><h2>Error Log</h2>{cleanup_btn}</div>
+{"<p class='mu'>No errors recorded.</p>" if not groups else sections}
+"""
+    return layout(body, active="e", title="Errors")
+
+
+@APP.post("/errors/cleanup")
+def errors_cleanup():
+    conn = db()
+    if conn:
+        conn.execute(
+            "UPDATE repost_registry SET status='cleanup', finalized_at=datetime('now'), updated_at=datetime('now') "
+            "WHERE status IN ('attempt_started','downloaded') AND finalized_at IS NULL "
+            "AND CAST((julianday('now')-julianday(created_at))*86400 AS INTEGER) > 3600"
+        )
+        conn.commit()
+        conn.close()
+    return redirect(url_for("errors_page"))
+
+
+# ── Stats ────────────────────────────────────────────────────────────────────
+
+@APP.get("/stats")
+def stats_page():
+    conn = db()
+    days_l, days_v, sub_l, sub_v, mime_l, mime_v, size_l, size_v = (
+        "[]", "[]", "[]", "[]", "[]", "[]", "[]", "[]"
+    )
+    if conn:
+        def jl(rows, key):
+            return json.dumps([r[key] for r in rows])
+        def jv(rows, key):
+            return json.dumps([r[key] for r in rows])
+
+        d = conn.execute(
+            "SELECT DATE(finalized_at) day, COUNT(*) n FROM repost_registry "
+            "WHERE status='posted' AND finalized_at>=date('now','-30 days') GROUP BY day ORDER BY day"
+        ).fetchall()
+        days_l, days_v = jl(d, "day"), jv(d, "n")
+
+        s = conn.execute(
+            "SELECT subreddit, COUNT(*) n FROM repost_registry WHERE status='posted' "
+            "GROUP BY subreddit ORDER BY n DESC LIMIT 15"
+        ).fetchall()
+        sub_l, sub_v = jl(s, "subreddit"), jv(s, "n")
+
+        m = conn.execute(
+            "SELECT CASE WHEN mime_type LIKE 'video%' THEN 'video' "
+            "WHEN mime_type LIKE 'image%' THEN 'image' ELSE 'other' END kind, COUNT(*) n "
+            "FROM repost_registry WHERE status='posted' GROUP BY kind"
+        ).fetchall()
+        mime_l, mime_v = jl(m, "kind"), jv(m, "n")
+
+        sz = conn.execute(
+            "SELECT subreddit, ROUND(AVG(media_bytes)/1000000.0,2) avg_mb "
+            "FROM repost_registry WHERE status='posted' AND media_bytes IS NOT NULL "
+            "GROUP BY subreddit ORDER BY avg_mb DESC LIMIT 10"
+        ).fetchall()
+        size_l, size_v = jl(sz, "subreddit"), jv(sz, "avg_mb")
+        conn.close()
+
+    body = f"""
+<h2>Stats</h2>
+<article>
+  <header><strong>Posts per Day (last 30 days)</strong></header>
+  <div class="cw"><canvas id="c1"></canvas></div>
+</article>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
+  <article><header><strong>Posts per Subreddit</strong></header><div class="cw"><canvas id="c2"></canvas></div></article>
+  <article><header><strong>Media Type</strong></header><div class="cw"><canvas id="c3"></canvas></div></article>
+</div>
+<article>
+  <header><strong>Avg File Size by Subreddit (MB)</strong></header>
+  <div class="cw"><canvas id="c4"></canvas></div>
+</article>
+<script>
+const cd={{responsive:true,maintainAspectRatio:false}};
+new Chart(document.getElementById('c1'),{{type:'bar',data:{{labels:{days_l},datasets:[{{label:'Posts',data:{days_v},borderRadius:3}}]}},options:{{...cd,plugins:{{legend:{{display:false}}}}}}}});
+new Chart(document.getElementById('c2'),{{type:'bar',data:{{labels:{sub_l},datasets:[{{label:'Posts',data:{sub_v},borderRadius:3}}]}},options:{{...cd,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}}});
+new Chart(document.getElementById('c3'),{{type:'doughnut',data:{{labels:{mime_l},datasets:[{{data:{mime_v},borderWidth:1}}]}},options:{{...cd,plugins:{{legend:{{position:'bottom'}}}}}}}});
+new Chart(document.getElementById('c4'),{{type:'bar',data:{{labels:{size_l},datasets:[{{label:'Avg MB',data:{size_v},borderRadius:3}}]}},options:{{...cd,indexAxis:'y',plugins:{{legend:{{display:false}}}}}}}});
+</script>
+"""
+    return layout(body, active="st", title="Stats")
+
+
+# ── Feed Preview ──────────────────────────────────────────────────────────────
+
+@APP.get("/feed-preview")
+def feed_preview():
+    items, errors, fetched_at = [], [], None
+    conn = db()
+    err_msg = ""
+
+    try:
+        r = requests.post(f"{WORKER_URL}/api/feed-pool", json={"subreddits": []}, timeout=30)
+        if r.ok:
+            data = r.json()
+            raw = data.get("items", [])[:60]
+            errors = data.get("errors", [])
+            fetched_at = data.get("fetchedAt", "")[:16]
+            if conn and raw:
+                seen = set()
+                for row in conn.execute("SELECT canonical_post_id, canonical_post_url FROM repost_registry").fetchall():
+                    if row["canonical_post_id"]:
+                        seen.add(row["canonical_post_id"])
+                    if row["canonical_post_url"]:
+                        seen.add(row["canonical_post_url"])
+                for item in raw:
+                    item["_seen"] = item.get("postId", "") in seen or item.get("permalink", "") in seen
+            items = raw
+        else:
+            err_msg = f"Worker returned {r.status_code}"
+    except Exception as exc:
+        err_msg = str(exc)
+
+    if conn:
+        conn.close()
+
+    new_count = sum(1 for i in items if not i.get("_seen"))
+
+    err_section = ""
+    if err_msg:
+        err_section = f"<article><p style='color:#f44336'>⚠ {err_msg}</p></article>"
+    if errors:
+        err_section += "<article><header><strong>Feed Errors</strong></header>" + "".join(
+            f"<p class='mu'>r/{e['subreddit']}: {e['error']}</p>" for e in errors
+        ) + "</article>"
+
+    def preview_row(i):
+        seen_badge = '<span class="badge bgr">seen</span>' if i.get("_seen") else '<span class="badge bg">new</span>'
+        opacity = "opacity:.4" if i.get("_seen") else ""
+        title = i.get("title", "")
+        title_s = title[:65] + ("…" if len(title) > 65 else "")
+        media = (i.get("mediaUrl", "") or "")[:40] or "—"
+        pub = (i.get("publishedAt", "") or "")[:10] or "—"
+        return (
+            f"<tr style='{opacity}'>"
+            f"<td>r/{i.get('subreddit','')}</td>"
+            f"<td><a href='{i.get('permalink','')}' target='_blank' rel='noopener'>{title_s}</a></td>"
+            f"<td class='mu' style='font-size:.8rem'>{media}</td>"
+            f"<td>{seen_badge}</td>"
+            f"<td class='mu'>{pub}</td></tr>"
+        )
+    rows_html = "".join(preview_row(i) for i in items)
+
+    body = f"""
+<div class="ph"><h2>Feed Preview</h2>
+  <span class="mu">{new_count} new / {len(items)} fetched{' · ' + fetched_at if fetched_at else ''}</span>
+</div>
+{err_section}
+{"<p class='mu'>No items — worker may be unreachable.</p>" if not items and not err_msg else ""}
+{'<article><table><thead><tr><th>Subreddit</th><th>Title</th><th>Media</th><th>Status</th><th>Published</th></tr></thead><tbody>' + rows_html + '</tbody></table></article>' if items else ""}
+"""
+    return layout(body, active="f", title="Feed Preview")
+
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+
+def _trigger_page_html(triggered=False, trigger_error=None):
+    last = None
+    data = n8n_get(f"/api/v1/executions?workflowId={N8N_WORKFLOW_ID}&limit=1")
+    if data and data.get("data"):
+        last = data["data"][0]
+
+    last_html = ""
+    if last:
+        stopped = last.get("stoppedAt", "")
+        last_html = f"""
+<article>
+  <header><strong>Last Execution</strong></header>
+  <table>
+    <tr><td>Status</td><td>{badge(last.get('status','?'))}</td></tr>
+    <tr><td>Started</td><td>{(last.get('startedAt') or '')[:19]}</td></tr>
+    <tr><td>Finished</td><td>{stopped[:19] if stopped else 'running…'}</td></tr>
+    <tr><td>Mode</td><td>{last.get('mode','—')}</td></tr>
+  </table>
+</article>"""
+
+    notice = ""
+    if triggered:
+        notice = "<article><header><strong>✅ Triggered</strong></header><p>Execution started. Check n8n for live progress.</p></article>"
+    elif trigger_error:
+        notice = f"<article><header><strong>⚠ Trigger Error</strong></header><p>{trigger_error}</p></article>"
+
+    body = f"""
+<h2>Manual Trigger</h2>
+<article style="text-align:center;padding:2rem">
+  <p class="mu">Immediately kick off the Shitpost Bot workflow in n8n.</p>
+  <form method="post" action="/trigger/run">
+    <button type="submit" style="font-size:1.2rem;padding:.75rem 2.5rem">▶ Run Now</button>
+  </form>
+</article>
+{last_html}
+{notice}
+"""
+    return layout(body, active="t", title="Run Now")
+
+
+@APP.get("/trigger")
+def trigger_page():
+    return _trigger_page_html()
+
+
+@APP.post("/trigger/run")
+def trigger_run():
+    error, triggered = None, False
+    try:
+        r = requests.post(
+            f"{N8N_URL}/api/v1/workflows/{N8N_WORKFLOW_ID}/run",
+            headers={"X-N8N-API-KEY": N8N_API_KEY, "Content-Type": "application/json"},
+            json={},
+            timeout=10,
+        )
+        if r.ok:
+            triggered = True
+        else:
+            error = f"n8n returned {r.status_code}: {r.text[:200]}"
+    except Exception as exc:
+        error = str(exc)
+    return _trigger_page_html(triggered=triggered, trigger_error=error)
+
+
+# ── JSON API ──────────────────────────────────────────────────────────────────
+
+@APP.get("/api/health")
+def api_health():
+    return jsonify({"worker": worker_health(), "n8n": n8n_health(),
+                    "time": datetime.now(timezone.utc).isoformat()})
+
+
+@APP.get("/api/subreddits")
+def api_subs_get():
+    return jsonify(load_subs())
+
+
+@APP.post("/api/subreddits")
+def api_subs_post():
+    body = request.get_json(silent=True) or {}
+    subs = body.get("subreddits")
+    if not isinstance(subs, list):
+        return jsonify({"error": "expected {subreddits:[...]}"}), 400
+    save_subs(subs)
+    return jsonify({"ok": True, "count": len(subs)})
+
+
+if __name__ == "__main__":
+    APP.run(host="0.0.0.0", port=8080, debug=False)

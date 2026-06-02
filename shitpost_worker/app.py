@@ -4,6 +4,7 @@ import html
 import json
 import mimetypes
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -384,7 +385,9 @@ def run_yt_dlp(url: str, attempt_id: int) -> Path:
         "--merge-output-format",
         "mp4",
         "--format",
-        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best[ext=mp4]/best",
+        "bv*+ba/b/best",
+        "--add-header",
+        f"User-Agent:{RSS_USER_AGENT}",
         "--output",
         output_template,
         url,
@@ -434,18 +437,57 @@ def healthz():
     return jsonify({"status": "ok", "time": now_iso()})
 
 
+SUBREDDITS_CONFIG_PATH = REGISTRY_PATH.parent / "subreddits.json"
+
+DEFAULT_SUBREDDITS = [
+    {"name": "MemeVideos", "weight": 1.0},
+    {"name": "MurderedByWords", "weight": 1.0},
+    {"name": "blursed_videos", "weight": 1.0},
+    {"name": "Kitchencels", "weight": 1.0},
+    {"name": "addressme", "weight": 1.0},
+    {"name": "CursedGuns", "weight": 1.0},
+    {"name": "perfectlycutvideos", "weight": 1.0},
+]
+
+
+def load_subreddits() -> list[dict[str, Any]]:
+    if SUBREDDITS_CONFIG_PATH.exists():
+        try:
+            return json.loads(SUBREDDITS_CONFIG_PATH.read_text())
+        except Exception:  # noqa: BLE001
+            pass
+    return DEFAULT_SUBREDDITS
+
+
 @APP.post("/api/feed-pool")
 def feed_pool():
     payload = request.get_json(silent=True) or {}
-    subreddits = payload.get("subreddits") or []
+    requested = payload.get("subreddits") or []
     items: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
-    for subreddit in subreddits:
+    if requested:
+        sub_configs = [{"name": str(s), "weight": 1.0} for s in requested]
+    else:
+        sub_configs = load_subreddits()
+
+    weight_map: dict[str, float] = {
+        c["name"]: float(c.get("weight") or 1.0) for c in sub_configs
+    }
+
+    for config in sub_configs:
+        subreddit = config["name"]
         try:
-            items.extend(parse_feed(str(subreddit)))
+            items.extend(parse_feed(subreddit))
         except Exception as exc:  # noqa: BLE001
-            errors.append({"subreddit": str(subreddit), "error": str(exc)})
+            errors.append({"subreddit": subreddit, "error": str(exc)})
+
+    # Weighted shuffle: higher-weight subreddits surface earlier in the queue.
+    # Each item draws a uniform random key scaled by 1/weight (Efraimidis-Spirakis).
+    for item in items:
+        w = weight_map.get(item.get("subreddit", ""), 1.0)
+        item["_priority"] = random.random() ** (1.0 / max(w, 0.01))
+    items.sort(key=lambda x: x.pop("_priority"), reverse=True)
 
     return json_response(
         {

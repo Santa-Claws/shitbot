@@ -41,3 +41,24 @@ services:
     volumes:
       - ./shared_media:/home/node/.n8n-files/shitpost_media
       - ./shitpost_data:/data
+
+  shitbot-manager:
+    build:
+      context: ./shitbot_manager
+    container_name: shitbot-manager
+    restart: unless-stopped
+    ports:
+      - "${SHITBOT_MANAGER_PORT:-8080}:8080"
+    environment:
+      - TZ=${TZ}
+      - N8N_URL=${N8N_URL:-http://n8n:5678}
+      - N8N_API_KEY=${N8N_API_KEY}
+      - N8N_WORKFLOW_ID=${N8N_WORKFLOW_ID:-1y22EifIaGNPK3hJ}
+      - SHITPOST_SERVICE_URL=${SHITPOST_SERVICE_URL}
+      - SHITPOST_REGISTRY_PATH=${SHITPOST_REGISTRY_PATH}
+    volumes:
+      - ./shitpost_data:/data
+      - ./shared_media:/media:ro
+    depends_on:
+      - shitpost-worker
+      - n8n
