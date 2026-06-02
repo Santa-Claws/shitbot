@@ -13,9 +13,7 @@ DB_PATH = Path(os.getenv("SHITPOST_REGISTRY_PATH", "/data/repost_registry.sqlite
 SUBS_PATH = Path("/data/subreddits.json")
 MEDIA_DIR = Path("/media")
 WORKER_URL = os.getenv("SHITPOST_SERVICE_URL", "http://shitpost-worker:8000").rstrip("/")
-N8N_URL = os.getenv("N8N_URL", "http://n8n:5678").rstrip("/")
-N8N_API_KEY = os.getenv("N8N_API_KEY", "")
-N8N_WORKFLOW_ID = os.getenv("N8N_WORKFLOW_ID", "")
+SCHEDULER_URL = os.getenv("SHITPOST_SCHEDULER_URL", "http://shitpost-scheduler:8001").rstrip("/")
 
 DEFAULT_SUBS = [
     {"name": "MemeVideos", "weight": 1.0},
@@ -144,16 +142,16 @@ def worker_health() -> bool:
         return False
 
 
-def n8n_health() -> bool:
+def scheduler_health() -> bool:
     try:
-        return requests.get(f"{N8N_URL}/healthz", timeout=3).ok
+        return requests.get(f"{SCHEDULER_URL}/healthz", timeout=3).ok
     except Exception:
         return False
 
 
-def n8n_get(path: str):
+def scheduler_status() -> dict | None:
     try:
-        r = requests.get(f"{N8N_URL}{path}", headers={"X-N8N-API-KEY": N8N_API_KEY}, timeout=5)
+        r = requests.get(f"{SCHEDULER_URL}/api/status", timeout=5)
         return r.json() if r.ok else None
     except Exception:
         return None
@@ -193,7 +191,11 @@ def dashboard():
         conn.close()
 
     wok = worker_health()
-    nok = n8n_health()
+    sched = scheduler_status()
+    sok = sched is not None
+    sched_state = (sched or {}).get("state", "unknown")
+    sched_next = ((sched or {}).get("next_run") or "")[:16]
+    sched_last = ((sched or {}).get("last_result") or "—")
     dbytes, dcount = media_usage()
     sc_labels = json.dumps(list(status_counts.keys()))
     sc_values = json.dumps(list(status_counts.values()))
@@ -220,7 +222,8 @@ def dashboard():
   <article>
     <header><strong>System Health</strong></header>
     <p><span class="hdot {'hok' if wok else 'herr'}"></span>shitpost-worker {'online' if wok else 'offline'}</p>
-    <p><span class="hdot {'hok' if nok else 'herr'}"></span>n8n {'online' if nok else 'offline'}</p>
+    <p><span class="hdot {'hok' if sok else 'herr'}"></span>scheduler {'online' if sok else 'offline'}</p>
+    <p class="mu" style="font-size:.85rem;margin-top:.5rem">State: <strong>{sched_state}</strong> · Last: {sched_last} · Next: {sched_next or '—'}</p>
   </article>
   <article>
     <header><strong>Status Breakdown</strong></header>
@@ -620,42 +623,48 @@ def feed_preview():
 
 # ── Trigger ───────────────────────────────────────────────────────────────────
 
-def _trigger_page_html(triggered=False, trigger_error=None):
-    last = None
-    data = n8n_get(f"/api/v1/executions?workflowId={N8N_WORKFLOW_ID}&limit=1")
-    if data and data.get("data"):
-        last = data["data"][0]
+def _trigger_page_html(notice: str = ""):
+    sched = scheduler_status()
+    state = (sched or {}).get("state", "unknown")
+    last_run = ((sched or {}).get("last_run") or "—")[:19]
+    next_run = ((sched or {}).get("next_run") or "—")[:19]
+    last_result = (sched or {}).get("last_result") or "—"
+    last_error = (sched or {}).get("last_error") or ""
+    last_post = (sched or {}).get("last_post") or {}
 
-    last_html = ""
-    if last:
-        stopped = last.get("stoppedAt", "")
-        last_html = f"""
-<article>
-  <header><strong>Last Execution</strong></header>
-  <table>
-    <tr><td>Status</td><td>{badge(last.get('status','?'))}</td></tr>
-    <tr><td>Started</td><td>{(last.get('startedAt') or '')[:19]}</td></tr>
-    <tr><td>Finished</td><td>{stopped[:19] if stopped else 'running…'}</td></tr>
-    <tr><td>Mode</td><td>{last.get('mode','—')}</td></tr>
-  </table>
-</article>"""
+    state_color = {"running": "#2196f3", "idle": "#4caf50", "error": "#f44336"}.get(state, "#9e9e9e")
 
-    notice = ""
-    if triggered:
-        notice = "<article><header><strong>✅ Triggered</strong></header><p>Execution started. Check n8n for live progress.</p></article>"
-    elif trigger_error:
-        notice = f"<article><header><strong>⚠ Trigger Error</strong></header><p>{trigger_error}</p></article>"
+    last_post_html = ""
+    if last_post:
+        lp_sub = last_post.get("subreddit", "")
+        lp_title = (last_post.get("title") or "")[:80]
+        last_post_html = f"<p class='mu'>Last posted: <strong>r/{lp_sub}</strong> — {lp_title}</p>"
+
+    error_html = f"<p style='color:#f44336'>{last_error}</p>" if last_error else ""
 
     body = f"""
 <h2>Manual Trigger</h2>
 <article style="text-align:center;padding:2rem">
-  <p class="mu">Immediately kick off the Shitpost Bot workflow in n8n.</p>
+  <p class="mu">Immediately kick off the Shitpost Bot.</p>
   <form method="post" action="/trigger/run">
-    <button type="submit" style="font-size:1.2rem;padding:.75rem 2.5rem">▶ Run Now</button>
+    <button type="submit" style="font-size:1.2rem;padding:.75rem 2.5rem" {'disabled' if state == 'running' else ''}>
+      {'⏳ Running…' if state == 'running' else '▶ Run Now'}
+    </button>
   </form>
+  {'<p class="mu" style="margin-top:.5rem">Refresh to check status after triggering.</p>' if state != 'running' else ''}
 </article>
-{last_html}
 {notice}
+<article>
+  <header><strong>Scheduler Status</strong></header>
+  <table>
+    <tr><td>State</td><td><span style="color:{state_color};font-weight:600">{state}</span></td></tr>
+    <tr><td>Last Run</td><td>{last_run} UTC</td></tr>
+    <tr><td>Last Result</td><td>{badge(last_result) if last_result != '—' else '—'}</td></tr>
+    <tr><td>Next Scheduled</td><td>{next_run} UTC</td></tr>
+  </table>
+  {last_post_html}
+  {error_html}
+</article>
 """
     return layout(body, active="t", title="Run Now")
 
@@ -667,28 +676,27 @@ def trigger_page():
 
 @APP.post("/trigger/run")
 def trigger_run():
-    error, triggered = None, False
+    notice = ""
     try:
-        r = requests.post(
-            f"{N8N_URL}/api/v1/workflows/{N8N_WORKFLOW_ID}/run",
-            headers={"X-N8N-API-KEY": N8N_API_KEY, "Content-Type": "application/json"},
-            json={},
-            timeout=10,
-        )
+        r = requests.post(f"{SCHEDULER_URL}/api/trigger", timeout=10)
         if r.ok:
-            triggered = True
+            data = r.json()
+            if data.get("status") == "already_running":
+                notice = "<article><p style='color:#ff9800'>⚠ Scheduler is already running — try again shortly.</p></article>"
+            else:
+                notice = "<article><p style='color:#4caf50'>✅ Triggered. Refresh in a few seconds to see the result.</p></article>"
         else:
-            error = f"n8n returned {r.status_code}: {r.text[:200]}"
+            notice = f"<article><p style='color:#f44336'>⚠ Scheduler returned {r.status_code}: {r.text[:200]}</p></article>"
     except Exception as exc:
-        error = str(exc)
-    return _trigger_page_html(triggered=triggered, trigger_error=error)
+        notice = f"<article><p style='color:#f44336'>⚠ {exc}</p></article>"
+    return _trigger_page_html(notice=notice)
 
 
 # ── JSON API ──────────────────────────────────────────────────────────────────
 
 @APP.get("/api/health")
 def api_health():
-    return jsonify({"worker": worker_health(), "n8n": n8n_health(),
+    return jsonify({"worker": worker_health(), "scheduler": scheduler_health(),
                     "time": datetime.now(timezone.utc).isoformat()})
 
 

@@ -1,31 +1,4 @@
 services:
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n
-    restart: unless-stopped
-    ports:
-      - "${N8N_PORT:-5678}:5678"
-    environment:
-      - TZ=${TZ}
-      - N8N_HOST=${N8N_HOST}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=http
-      - N8N_LISTEN_ADDRESS=0.0.0.0
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - N8N_SECURE_COOKIE=false
-      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-      - N8N_BLOCK_ENV_ACCESS_IN_NODE=${N8N_BLOCK_ENV_ACCESS_IN_NODE}
-      - N8N_RESTRICT_FILE_ACCESS_TO=${N8N_RESTRICT_FILE_ACCESS_TO}
-      - SHITPOST_SERVICE_URL=${SHITPOST_SERVICE_URL}
-      - SHITPOST_DISCORD_WEBHOOK_URL=${SHITPOST_DISCORD_WEBHOOK_URL}
-    volumes:
-      - ./n8n_data:/home/node/.n8n
-      - ./shared_media:/home/node/.n8n-files/shitpost_media
-    depends_on:
-      - shitpost-worker
-
   shitpost-worker:
     build:
       context: ./shitpost_worker
@@ -42,6 +15,22 @@ services:
       - ./shared_media:/home/node/.n8n-files/shitpost_media
       - ./shitpost_data:/data
 
+  shitpost-scheduler:
+    build:
+      context: ./shitpost_scheduler
+    container_name: shitpost-scheduler
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - SHITPOST_SERVICE_URL=${SHITPOST_SERVICE_URL}
+      - SHITPOST_DISCORD_WEBHOOK_URL=${SHITPOST_DISCORD_WEBHOOK_URL}
+      - SHITPOST_INTERVAL_HOURS=${SHITPOST_INTERVAL_HOURS:-4}
+      - SHITPOST_MEDIA_DIR=/media
+    volumes:
+      - ./shared_media:/media:ro
+    depends_on:
+      - shitpost-worker
+
   shitbot-manager:
     build:
       context: ./shitbot_manager
@@ -51,14 +40,12 @@ services:
       - "${SHITBOT_MANAGER_PORT:-8080}:8080"
     environment:
       - TZ=${TZ}
-      - N8N_URL=${N8N_URL:-http://n8n:5678}
-      - N8N_API_KEY=${N8N_API_KEY}
-      - N8N_WORKFLOW_ID=${N8N_WORKFLOW_ID:-1y22EifIaGNPK3hJ}
       - SHITPOST_SERVICE_URL=${SHITPOST_SERVICE_URL}
       - SHITPOST_REGISTRY_PATH=${SHITPOST_REGISTRY_PATH}
+      - SHITPOST_SCHEDULER_URL=${SHITPOST_SCHEDULER_URL:-http://shitpost-scheduler:8001}
     volumes:
       - ./shitpost_data:/data
       - ./shared_media:/media:ro
     depends_on:
       - shitpost-worker
-      - n8n
+      - shitpost-scheduler
