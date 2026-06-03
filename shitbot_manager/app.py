@@ -44,7 +44,7 @@ NAV = """
     <li><a href="/errors" {ea}>Errors</a></li>
     <li><a href="/stats" {sta}>Stats</a></li>
     <li><a href="/feed-preview" {fa}>Feed Preview</a></li>
-    <li><a href="/trigger" {ta}>▶ Run Now</a></li>
+    <li><a href="/scheduling" {sca}>Scheduling</a></li>
   </ul>
 </nav>
 """
@@ -96,7 +96,7 @@ def layout(body: str, active: str = "", title: str = "Shitbot") -> str:
     nav = NAV.format(
         da=a(active == "d"), sa=a(active == "s"), ha=a(active == "h"),
         ea=a(active == "e"), sta=a(active == "st"), fa=a(active == "f"),
-        ta=a(active == "t"),
+        sca=a(active == "sc"),
     )
     return HEAD.format(title=title, css=CSS, nav=nav) + body + FOOT
 
@@ -152,6 +152,14 @@ def scheduler_health() -> bool:
 def scheduler_status() -> dict | None:
     try:
         r = requests.get(f"{SCHEDULER_URL}/api/status", timeout=5)
+        return r.json() if r.ok else None
+    except Exception:
+        return None
+
+
+def scheduler_config() -> dict | None:
+    try:
+        r = requests.get(f"{SCHEDULER_URL}/api/config", timeout=5)
         return r.json() if r.ok else None
     except Exception:
         return None
@@ -690,6 +698,152 @@ def trigger_run():
     except Exception as exc:
         notice = f"<article><p style='color:#f44336'>⚠ {exc}</p></article>"
     return _trigger_page_html(notice=notice)
+
+
+# ── Scheduling ───────────────────────────────────────────────────────────────
+
+def _scheduling_page_html(notice: str = "") -> str:
+    cfg = scheduler_config() or {
+        "interval_hours": 4, "posts_per_run": 1,
+        "max_failures_per_run": 10, "failure_alert_enabled": True,
+        "failure_alert_webhook": "",
+    }
+    sched = scheduler_status()
+    state = (sched or {}).get("state", "unknown")
+    next_run = ((sched or {}).get("next_run") or "—")[:19]
+    last_result = (sched or {}).get("last_result") or "—"
+    last_post = (sched or {}).get("last_post") or {}
+    run_stats = (sched or {}).get("last_run_stats") or {}
+    posted_n = run_stats.get("posted", 0)
+    fail_n = run_stats.get("failures", 0)
+
+    state_color = {"running": "#2196f3", "idle": "#4caf50", "failure_limit_reached": "#f44336"}.get(state, "#9e9e9e")
+
+    iv = cfg.get("interval_hours", 4)
+    ppr = cfg.get("posts_per_run", 1)
+    mf = cfg.get("max_failures_per_run", 10)
+    alert_on = cfg.get("failure_alert_enabled", True)
+    alert_wh = cfg.get("failure_alert_webhook", "") or ""
+
+    alert_checked = "checked" if alert_on else ""
+
+    last_post_html = ""
+    if last_post:
+        lp_sub = last_post.get("subreddit", "")
+        lp_title = (last_post.get("title") or "")[:80]
+        last_post_html = f"<p class='mu' style='margin-top:.5rem'>Last posted: <strong>r/{lp_sub}</strong> — {lp_title}</p>"
+
+    run_stats_html = ""
+    if sched:
+        result_badge = badge(last_result) if last_result != "—" else "—"
+        run_stats_html = f"<p class='mu' style='margin-top:.25rem'>Last run: {result_badge} · {posted_n} posted · {fail_n} failures</p>"
+
+    body = f"""
+<div class="ph"><h2>Scheduling</h2></div>
+{notice}
+<form method="post" action="/scheduling/save">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+  <article>
+    <header><strong>Schedule</strong></header>
+    <label>Interval (hours)
+      <input type="number" name="interval_hours" value="{iv}" min="0.1" max="168" step="0.1" required>
+    </label>
+    <label>Posts per run
+      <input type="number" name="posts_per_run" value="{ppr}" min="1" max="50" step="1" required>
+      <small class="mu">Bot will keep trying until this many posts succeed each run.</small>
+    </label>
+  </article>
+  <article>
+    <header><strong>Failure Failsafe</strong></header>
+    <label>Max failures per run
+      <input type="number" name="max_failures_per_run" value="{mf}" min="1" max="100" step="1" required>
+      <small class="mu">Stop the run early after this many download or post failures.</small>
+    </label>
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" name="failure_alert_enabled" value="1" {alert_checked} style="width:auto;margin:0">
+      Send alert when failure limit is hit
+    </label>
+    <label style="margin-top:.5rem">Alert webhook URL
+      <input type="url" name="failure_alert_webhook" value="{alert_wh}" placeholder="https://discord.com/api/webhooks/…">
+      <small class="mu">Leave blank to use the main Discord webhook. Can be a different channel.</small>
+    </label>
+  </article>
+</div>
+<button type="submit">Save Settings</button>
+</form>
+
+<article style="margin-top:1.5rem">
+  <header><strong>Manual Run</strong></header>
+  <form method="post" action="/scheduling/trigger" style="display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem">
+    <label style="margin:0">
+      Posts this run
+      <input type="number" name="posts_this_run" value="{ppr}" min="1" max="50" step="1" style="width:80px;margin:0">
+    </label>
+    <button type="submit" style="margin-bottom:1px" {'disabled' if state == 'running' else ''}>
+      {'⏳ Running…' if state == 'running' else '▶ Run Now'}
+    </button>
+  </form>
+  <table style="margin-top:.5rem">
+    <tr><td style="width:140px">State</td><td><span style="color:{state_color};font-weight:600">{state}</span></td></tr>
+    <tr><td>Next scheduled</td><td>{next_run} UTC</td></tr>
+  </table>
+  {last_post_html}
+  {run_stats_html}
+</article>
+"""
+    return layout(body, active="sc", title="Scheduling")
+
+
+@APP.get("/scheduling")
+def scheduling_page():
+    return _scheduling_page_html()
+
+
+@APP.post("/scheduling/save")
+def scheduling_save():
+    notice = ""
+    form = request.form
+    payload: dict = {}
+    try:
+        payload["interval_hours"] = float(form.get("interval_hours", 4))
+        payload["posts_per_run"] = int(form.get("posts_per_run", 1))
+        payload["max_failures_per_run"] = int(form.get("max_failures_per_run", 10))
+        payload["failure_alert_enabled"] = bool(form.get("failure_alert_enabled"))
+        payload["failure_alert_webhook"] = form.get("failure_alert_webhook", "").strip()
+        r = requests.post(f"{SCHEDULER_URL}/api/config", json=payload, timeout=10)
+        if r.ok:
+            notice = "<article><p style='color:#4caf50'>✅ Settings saved.</p></article>"
+        else:
+            notice = f"<article><p style='color:#f44336'>⚠ Scheduler returned {r.status_code}: {r.text[:200]}</p></article>"
+    except Exception as exc:
+        notice = f"<article><p style='color:#f44336'>⚠ {exc}</p></article>"
+    return _scheduling_page_html(notice=notice)
+
+
+@APP.post("/scheduling/trigger")
+def scheduling_trigger():
+    notice = ""
+    try:
+        posts_this_run = int(request.form.get("posts_this_run", 1))
+    except (TypeError, ValueError):
+        posts_this_run = 1
+    try:
+        r = requests.post(
+            f"{SCHEDULER_URL}/api/trigger",
+            json={"posts_this_run": posts_this_run},
+            timeout=10,
+        )
+        if r.ok:
+            data = r.json()
+            if data.get("status") == "already_running":
+                notice = "<article><p style='color:#ff9800'>⚠ Scheduler is already running — try again shortly.</p></article>"
+            else:
+                notice = f"<article><p style='color:#4caf50'>✅ Triggered ({posts_this_run} post{'s' if posts_this_run != 1 else ''}). Refresh to see result.</p></article>"
+        else:
+            notice = f"<article><p style='color:#f44336'>⚠ Scheduler returned {r.status_code}: {r.text[:200]}</p></article>"
+    except Exception as exc:
+        notice = f"<article><p style='color:#f44336'>⚠ {exc}</p></article>"
+    return _scheduling_page_html(notice=notice)
 
 
 # ── JSON API ──────────────────────────────────────────────────────────────────

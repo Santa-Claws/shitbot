@@ -6,7 +6,7 @@ from pathlib import Path
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 APP = Flask(__name__)
 
@@ -14,6 +14,15 @@ WORKER_URL = os.environ.get("SHITPOST_SERVICE_URL", "http://shitpost-worker:8000
 DISCORD_WEBHOOK_URL = os.environ.get("SHITPOST_DISCORD_WEBHOOK_URL", "")
 INTERVAL_HOURS = float(os.environ.get("SHITPOST_INTERVAL_HOURS", "4"))
 MEDIA_DIR = Path(os.environ.get("SHITPOST_MEDIA_DIR", "/media"))
+SCHEDULING_CONFIG_PATH = Path(os.environ.get("SHITPOST_DATA_DIR", "/data")) / "scheduling.json"
+
+DEFAULT_CONFIG: dict = {
+    "interval_hours": INTERVAL_HOURS,
+    "posts_per_run": 1,
+    "max_failures_per_run": 10,
+    "failure_alert_enabled": True,
+    "failure_alert_webhook": "",
+}
 
 _lock = threading.Lock()
 _status: dict = {
@@ -22,7 +31,24 @@ _status: dict = {
     "last_result": None,
     "last_error": None,
     "last_post": None,
+    "last_run_stats": {"posted": 0, "failures": 0},
 }
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if SCHEDULING_CONFIG_PATH.exists():
+        try:
+            saved = json.loads(SCHEDULING_CONFIG_PATH.read_text())
+            cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    SCHEDULING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULING_CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
 
 def post_to_discord(item: dict, file_name: str | None, mime_type: str | None) -> bool:
@@ -50,13 +76,32 @@ def post_to_discord(item: dict, file_name: str | None, mime_type: str | None) ->
         return False
 
 
-def run_post_job() -> None:
+def send_failure_alert(cfg: dict, failure_count: int) -> None:
+    if not cfg.get("failure_alert_enabled"):
+        return
+    webhook = cfg.get("failure_alert_webhook", "").strip()
+    if not webhook:
+        return
+    msg = f"⚠️ shitbot hit {failure_count} failures this run and stopped early. Check the error log."
+    try:
+        requests.post(webhook, json={"content": msg, "username": "shitbot"}, timeout=15)
+    except Exception:
+        pass
+
+
+def run_post_job(posts_this_run: int | None = None) -> None:
     if not _lock.acquire(blocking=False):
         return
+
+    cfg = load_config()
+    target = posts_this_run if posts_this_run is not None else cfg["posts_per_run"]
+    max_fail = cfg["max_failures_per_run"]
+    select_limit = target + max_fail
 
     _status["state"] = "running"
     _status["last_run"] = datetime.now(timezone.utc).isoformat()
     result, error, last_post = "skipped", None, None
+    posted_count, failure_count = 0, 0
 
     try:
         pool_r = requests.post(f"{WORKER_URL}/api/feed-pool", json={"subreddits": []}, timeout=30)
@@ -65,20 +110,27 @@ def run_post_job() -> None:
 
         sel_r = requests.post(
             f"{WORKER_URL}/api/select-attempts",
-            json={"queue": candidates, "limit": 10},
+            json={"queue": candidates, "limit": select_limit},
             timeout=10,
         )
         sel_r.raise_for_status()
         items = sel_r.json().get("items", [])
 
         for item in items:
+            if posted_count >= target:
+                break
+            if failure_count >= max_fail:
+                send_failure_alert(cfg, failure_count)
+                result = "failure_limit_reached"
+                break
+
             prep_r = requests.post(f"{WORKER_URL}/api/prepare-attempt", json=item, timeout=130)
             prep_data = prep_r.json()
             attempt_id = prep_data.get("attemptId")
             status = prep_data.get("status")
 
             if status != "ready":
-                # Worker already finalized skip/error cases; just move on
+                failure_count += 1
                 continue
 
             file_name = prep_data.get("fileName")
@@ -93,18 +145,28 @@ def run_post_job() -> None:
             )
 
             if ok:
-                result = "posted"
+                posted_count += 1
                 last_post = {
                     "title": (item.get("title") or "")[:100],
                     "subreddit": item.get("subreddit", ""),
                 }
-                break
+            else:
+                failure_count += 1
+
+        if posted_count > 0 and result != "failure_limit_reached":
+            result = "posted"
 
     except Exception as exc:
         result = "error"
         error = str(exc)[:500]
     finally:
-        _status.update({"state": "idle", "last_result": result, "last_error": error, "last_post": last_post})
+        _status.update({
+            "state": "idle",
+            "last_result": result,
+            "last_error": error,
+            "last_post": last_post,
+            "last_run_stats": {"posted": posted_count, "failures": failure_count},
+        })
         _lock.release()
 
 
@@ -122,15 +184,59 @@ def healthz():
 
 @APP.get("/api/status")
 def api_status():
-    return jsonify({**_status, "next_run": _next_run()})
+    return jsonify({**_status, "next_run": _next_run(), "config": load_config()})
 
 
 @APP.post("/api/trigger")
 def api_trigger():
     if _status["state"] == "running":
         return jsonify({"status": "already_running"}), 409
-    threading.Thread(target=run_post_job, daemon=True).start()
+    body = request.get_json(silent=True) or {}
+    posts_this_run = body.get("posts_this_run")
+    if posts_this_run is not None:
+        try:
+            posts_this_run = max(1, int(posts_this_run))
+        except (TypeError, ValueError):
+            posts_this_run = None
+    threading.Thread(target=run_post_job, args=(posts_this_run,), daemon=True).start()
     return jsonify({"status": "triggered"})
+
+
+@APP.get("/api/config")
+def api_config_get():
+    return jsonify(load_config())
+
+
+@APP.post("/api/config")
+def api_config_post():
+    body = request.get_json(silent=True) or {}
+    cfg = load_config()
+    old_interval = cfg["interval_hours"]
+
+    for key in DEFAULT_CONFIG:
+        if key in body:
+            val = body[key]
+            if key == "interval_hours":
+                val = max(0.1, float(val))
+            elif key == "posts_per_run":
+                val = max(1, int(val))
+            elif key == "max_failures_per_run":
+                val = max(1, int(val))
+            elif key == "failure_alert_enabled":
+                val = bool(val)
+            elif key == "failure_alert_webhook":
+                val = str(val).strip()
+            cfg[key] = val
+
+    save_config(cfg)
+
+    new_interval = cfg["interval_hours"]
+    if new_interval != old_interval:
+        job = scheduler.get_job("post_job")
+        if job:
+            scheduler.reschedule_job("post_job", trigger="interval", hours=new_interval)
+
+    return jsonify({"status": "ok", "config": cfg})
 
 
 scheduler = BackgroundScheduler(timezone="UTC")

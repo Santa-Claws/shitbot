@@ -26,8 +26,10 @@ services:
       - SHITPOST_DISCORD_WEBHOOK_URL=${SHITPOST_DISCORD_WEBHOOK_URL}
       - SHITPOST_INTERVAL_HOURS=${SHITPOST_INTERVAL_HOURS:-4}
       - SHITPOST_MEDIA_DIR=/media
+      - SHITPOST_DATA_DIR=/data
     volumes:
       - ./shared_media:/media:ro
+      - ./shitpost_data:/data
     depends_on:
       - shitpost-worker
 
