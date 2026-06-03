@@ -56,16 +56,9 @@ Open `http://<your-lan-ip>:5678`, find **Shitpost Bot - Reddit Weekly to Discord
 docker compose down
 ```
 
-## Workflow management (n8n-as-code)
+## Workflow management
 
-The workflow is tracked as TypeScript in `automations/`. To sync changes:
-
-```bash
-cd automations
-npm run list      # list remote workflows
-npm run pull      # pull remote → local
-npm run push      # push local → remote
-```
+The workflow is tracked as TypeScript in `automations/` using n8n-as-code. See [`docs/n8n-as-code.md`](docs/n8n-as-code.md) for setup and usage.
 
 ## File layout
 
