@@ -26,9 +26,7 @@ _status: dict = {
 
 
 def post_to_discord(item: dict, file_name: str | None, mime_type: str | None) -> bool:
-    title = (item.get("title") or "")[:280]
-    content = f"**{title}**" if title else "​"
-    payload = {"content": content, "username": "shitbot"}
+    payload = {"username": "shitbot"}
 
     if file_name:
         file_path = MEDIA_DIR / file_name
