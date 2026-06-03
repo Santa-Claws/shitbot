@@ -419,9 +419,11 @@ def download_media(candidate: dict[str, Any], attempt_id: int) -> Path:
         urls_to_try: list[str] = []
         # v.redd.it redirects to a Reddit post page which now requires auth.
         # The public DASH manifest at /DASHPlaylist.mpd works without credentials.
-        parsed_media = urlparse(media_url)
-        if (parsed_media.hostname or "").lower() == "v.redd.it":
-            vid_id = parsed_media.path.strip("/").split("/")[0]
+        # Check the *original* mediaUrl — canonicalMediaUrl has already followed the redirect.
+        original_media_url = normalize_text(candidate.get("mediaUrl"))
+        parsed_original = urlparse(original_media_url)
+        if (parsed_original.hostname or "").lower() == "v.redd.it":
+            vid_id = parsed_original.path.strip("/").split("/")[0]
             if vid_id:
                 urls_to_try.append(f"https://v.redd.it/{vid_id}/DASHPlaylist.mpd")
         urls_to_try.extend(u for u in [media_url, permalink] if u)
