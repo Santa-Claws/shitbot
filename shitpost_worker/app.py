@@ -416,9 +416,16 @@ def download_media(candidate: dict[str, Any], attempt_id: int) -> Path:
 
     if strategy == "video":
         errors: list[str] = []
-        for url in [media_url, permalink]:
-            if not url:
-                continue
+        urls_to_try: list[str] = []
+        # v.redd.it redirects to a Reddit post page which now requires auth.
+        # The public DASH manifest at /DASHPlaylist.mpd works without credentials.
+        parsed_media = urlparse(media_url)
+        if (parsed_media.hostname or "").lower() == "v.redd.it":
+            vid_id = parsed_media.path.strip("/").split("/")[0]
+            if vid_id:
+                urls_to_try.append(f"https://v.redd.it/{vid_id}/DASHPlaylist.mpd")
+        urls_to_try.extend(u for u in [media_url, permalink] if u)
+        for url in urls_to_try:
             try:
                 return run_yt_dlp(url, attempt_id)
             except subprocess.TimeoutExpired:
