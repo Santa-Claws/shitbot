@@ -27,8 +27,7 @@ _status: dict = {
 
 def post_to_discord(item: dict, file_name: str | None, mime_type: str | None) -> bool:
     title = (item.get("title") or "")[:280]
-    permalink = item.get("permalink", "")
-    content = (f"**{title}**\n{permalink}" if title else permalink)[:2000]
+    content = f"**{title}**" if title else "​"
     payload = {"content": content, "username": "shitbot"}
 
     if file_name:
