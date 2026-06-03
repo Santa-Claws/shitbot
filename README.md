@@ -1,107 +1,130 @@
-# n8n Shitpost Bot
+# shitbot
 
-Self-hosted n8n instance with a Reddit-to-Discord shitpost bot workflow. Runs on Docker Compose with a sidecar media worker.
+Pulls the weekly top posts from a configurable list of subreddits and drops them into a Discord channel every 4 hours. Images and videos only, no text, no links. Built to run self-hosted on a Proxmox LXC or any Docker host.
 
-## What it does
+## How it works (short version)
 
-Every 4 hours, the workflow:
-1. Pulls the weekly top posts from 7 subreddits via RSS
-2. Shuffles the pool and selects up to 10 posts not already seen
-3. Downloads each post's media (video via yt-dlp, images directly)
-4. Posts the file to a Discord webhook
-5. Records every attempt in a SQLite registry so nothing gets reposted
+Three containers talk to each other:
 
-**Subreddits:** r/MemeVideos, r/MurderedByWords, r/blursed_videos, r/Kitchencels, r/addressme, r/CursedGuns, r/perfectlycutvideos
+- **shitpost-worker** — fetches Reddit RSS, downloads media, tracks what's been posted
+- **shitpost-scheduler** — runs every 4 hours, picks a post, calls the worker, sends it to Discord
+- **shitbot-manager** — web UI on port 8080 for managing subreddits and watching what's happening
 
-## Architecture
+See [`docs/how-it-works.md`](docs/how-it-works.md) for the full breakdown.
 
-```
-n8n (port 5678)  <-->  shitpost-worker (port 8000, internal)
-                              |
-                        SQLite registry (/data/)
-                        Shared media volume (./shared_media)
-```
-
-The `shitpost-worker` sidecar owns all the fragile parts: RSS fetching, `yt-dlp` downloads, file hashing, and the anti-repost SQLite registry. n8n stays thin — it handles scheduling, per-item orchestration, Discord uploads, and cleanup calls.
+---
 
 ## Setup
 
-### 1. Copy and fill in secrets
+### Prerequisites
+
+- Docker + Docker Compose
+- A Discord webhook URL
+
+### 1. Clone
+
+```bash
+git clone https://github.com/Santa-Claws/shitbot
+cd shitbot
+```
+
+### 2. Configure
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
-- `N8N_HOST` — your machine's LAN IP
-- `WEBHOOK_URL` — same IP with port
-- `N8N_BASIC_AUTH_PASSWORD` — set something strong
-- `SHITPOST_DISCORD_WEBHOOK_URL` — your Discord webhook URL
+Edit `.env` — the only required fields:
 
-### 2. Start
+| Variable | What to set |
+|---|---|
+| `SHITPOST_DISCORD_WEBHOOK_URL` | Your Discord webhook URL |
+| `TZ` | Your timezone, e.g. `America/New_York` |
+
+Everything else has sane defaults. Optional tweaks:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SHITPOST_INTERVAL_HOURS` | `4` | How often to post |
+| `SHITBOT_MANAGER_PORT` | `8080` | Port for the management UI |
+| `SHITPOST_MAX_MEDIA_BYTES` | `24000000` | Max file size (Discord limit is 25MB) |
+| `SHITPOST_DOWNLOAD_TIMEOUT_SECONDS` | `120` | Per-item download timeout |
+
+### 3. Start
 
 ```bash
 docker compose up -d
 ```
 
-First run builds the `shitpost-worker` image (includes `yt-dlp` + `ffmpeg`, takes a few minutes).
+First run builds the worker image (pulls yt-dlp + ffmpeg — takes a minute or two). After that, the scheduler fires immediately and then every `SHITPOST_INTERVAL_HOURS` hours.
 
-### 3. Activate the workflow
+### 4. Open the management UI
 
-Open `http://<your-lan-ip>:5678`, find **Shitpost Bot - Reddit Weekly to Discord**, and toggle it active.
-
-### 4. Stop
-
-```bash
-docker compose down
+```
+http://<your-host-ip>:8080
 ```
 
-## Workflow management (n8n-as-code)
+From here you can add/remove subreddits, adjust weights, view post history, and trigger a run manually.
 
-The workflow is tracked as TypeScript in `automations/`. To sync changes:
+---
 
-```bash
-cd automations
-npm run list      # list remote workflows
-npm run pull      # pull remote → local
-npm run push      # push local → remote
-```
+## Managing subreddits
+
+Go to **http://\<host\>:8080/subreddits**.
+
+- **Add** a subreddit by name + weight
+- **Remove** any subreddit
+- **Set weight** to control how often a subreddit is selected relative to others — weight 2.0 means roughly twice as likely to be picked as weight 1.0
+
+Changes take effect on the next run. The config lives at `shitpost_data/subreddits.json` and can also be edited directly.
+
+Default subreddits: r/MemeVideos, r/MurderedByWords, r/blursed_videos, r/Kitchencels, r/addressme, r/CursedGuns, r/perfectlycutvideos
+
+---
+
+## Management UI pages
+
+| Page | What it does |
+|---|---|
+| `/` | Dashboard — stats, recent posts, system health |
+| `/subreddits` | Add, remove, and reweight subreddits |
+| `/history` | Full post history with filters |
+| `/errors` | Error log grouped by failure type |
+| `/stats` | Charts — posts per day, per subreddit, media type breakdown |
+| `/feed-preview` | Live preview of what's currently in the RSS pool |
+| `/trigger` | Manual "Run Now" button + scheduler status |
+
+---
 
 ## File layout
 
 ```
-.
+shitbot/
 ├── docker-compose.yml
 ├── .env.example
-├── shitpost_worker/
-│   ├── app.py          # Flask sidecar: feed fetch, download, registry
+├── shitpost_worker/        # data layer container
+│   ├── app.py
 │   ├── Dockerfile
 │   └── requirements.txt
-├── automations/
-│   └── workflows/local_5678_mira_c/personal/
-│       └── Shitpost Bot - Reddit Weekly to Discord.workflow.ts
-├── shared_media/       # ephemeral media files (gitignored)
-├── shitpost_data/      # SQLite registry (gitignored)
-└── n8n_data/           # n8n database + config (gitignored)
+├── shitpost_scheduler/     # orchestration + cron container
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── shitbot_manager/        # web UI container
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── docs/
+│   └── how-it-works.md
+├── shitpost_data/          # SQLite registry + subreddits.json (gitignored)
+└── shared_media/           # ephemeral downloaded files (gitignored)
 ```
 
-## Anti-repost registry
+---
 
-The worker maintains a SQLite database at `shitpost_data/repost_registry.sqlite`. Every attempt — successful or failed — is recorded permanently. A post is blocked if its post ID, URL, or content hash matches anything already in the registry.
+## Branches
 
-## Sidecar API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/healthz` | Health check |
-| POST | `/api/feed-pool` | Fetch RSS pool for given subreddits |
-| POST | `/api/select-attempts` | Filter queue against registry, return up to N candidates |
-| POST | `/api/prepare-attempt` | Create registry entry + download media |
-| POST | `/api/finalize-attempt` | Mark outcome, delete temp file |
-
-## Notes
-
-- Max file size: 24 MB (Discord limit)
-- Download timeout: 120 seconds per item
-- `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` is required for the workflow to read env vars
-- Data is on LAN HTTP only — put n8n behind HTTPS before exposing to the internet
+| Branch | Description |
+|---|---|
+| `main` | Current — lightweight Python scheduler, no n8n |
+| `n8n` | Legacy — same bot orchestrated through n8n |
